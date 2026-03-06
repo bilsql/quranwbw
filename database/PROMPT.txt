@@ -1,0 +1,351 @@
+You are a backend engineer. Your task is to build a complete PostgreSQL 18+
+database schema and an async Python seeder that extracts the full Quran
+word-by-word content from the open quranwbw CDN, stores it in the database,
+and exposes it through an asyncpg-compatible API so that a web or mobile
+front-end can display every verse word by word with its meaning in the
+user's chosen language.
+
+=============================================================================
+CONTEXT – WHERE THE DATA COMES FROM
+=============================================================================
+
+The project "QuranWBW" (https://quranwbw.com) serves the entire Quran in a
+word-by-word format. All content lives as versioned JSON files on a public CDN:
+
+  Base URL: https://static.quranwbw.com/data/v4
+
+There is NO local database in the project. The browser fetches JSON on demand
+and caches it in IndexedDB (Dexie.js). Your job is to mirror that data into
+PostgreSQL so a server-side API can serve it.
+
+=============================================================================
+DATA ENDPOINTS AND JSON STRUCTURES
+=============================================================================
+
+-- 1. Arabic word-by-word text (Uthmanic script) --
+
+  GET {BASE}/words-data/arabic/{fontId}.json?version={v}
+
+  Use fontId=1, version=5 (the standard Uthmanic Digital font).
+
+  JSON structure:
+  {
+    "1": {                        <- chapter number (1–114)
+      "1": [                      <- verse number
+        ["word1","word2",...],    <- Arabic glyph per word
+        [1, 1, ...],              <- mushaf line number per word
+        ["end-icon"]              <- optional end-of-verse glyph
+      ],
+      "2": [ ... ],
+      ...
+    },
+    "2": { ... },
+    ...
+  }
+
+-- 2. Word-by-word transliteration --
+
+  GET {BASE}/words-data/transliterations/{id}.json?version={v}
+
+  Use id=1, version=1 (Normal transliteration).
+  Structure is identical to the Arabic endpoint; inner arrays contain
+  Latin-script strings instead of Arabic glyphs.
+
+-- 3. Word-by-word translations (per language) --
+
+  GET {BASE}/words-data/translations/{languageId}.json?version={v}
+
+  Structure is identical to the Arabic endpoint; inner arrays contain
+  translated strings.
+
+  Available language IDs and their versions:
+    1  → English            (version 4)
+    2  → Urdu               (version 1, RTL, font: font-Urdu)
+    3  → Hindi              (version 1)
+    4  → Indonesian         (version 1)
+    5  → Bangla             (version 1)
+    6  → Turkish            (version 1)
+    7  → Tamil              (version 1)
+    8  → German             (version 1)
+    11 → French             (version 1)
+    12 → Malayalam (Amani)  (version 1)
+    13 → Malayalam (Lalitha)(version 1)
+    14 → Chinese Trad.      (version 1)
+    15 → Chinese Zhuyin     (version 1)
+    16 → Chinese Simplified (version 1)
+    17 → Chinese Pinyin     (version 1)
+    18 → Divehi             (version 1, RTL)
+    19 → Persian            (version 1, RTL, font: font-Urdu)
+    20 → Sindhi             (version 1, RTL, font: font-Sindhi)
+    21 → Albanian           (version 1)
+    22 → Sign Language      (version 1)
+
+-- 4. Verse metadata (page, juz) --
+
+  GET {BASE}/meta/verseKeyData.json?version=2
+
+  JSON structure:
+  {
+    "1:1": { "chapter": 1, "verse": 1, "page": 1, "juz": 1, "words": 7 },
+    "1:2": { ... },
+    ...
+  }
+  Keys are "chapter:verse". There are 6,236 verses total.
+
+-- 5. Full-verse (ayah) translations --
+
+  GET {BASE}/verse-translations/{resourceId}.json?version={v}
+
+  The CDN may return EITHER of two formats – handle both:
+
+  Format A (flat):
+    { "1:1": "In the name of Allah ...", "1:2": "...", ... }
+
+  Format B (nested):
+    { "1": { "1": "In the name of Allah ...", "2": "..." }, "2": { ... }, ... }
+
+  Available translation resources (resourceId → language, version):
+    88  → Albanian,    Hasan Efendi Nahi,                v1
+    161 → Bangla,      Taisirul Quran,                   v1
+    163 → Bangla,      Sheikh Mujibur Rahman,            v1
+    162 → Bangla,      Rawai Al-bayan,                   v1
+    213 → Bangla,      Dr. Abu Bakr Muhammad Zakaria,    v1
+    56  → Chinese,     Ma Jain (Simplified),             v1
+    109 → Chinese,     Muhammad Makin,                   v1
+    86  → Divehi,      Office of the president,          v1  (RTL)
+    840 → Divehi,      Abu Bakr Ibrahim Ali,             v1  (RTL)
+    131 → English,     The Clear Quran (Khattab),        v1
+    20  → English,     Saheeh International,             v1
+    84  → English,     Mufti Taqi Usmani,                v1
+    85  → English,     Abdel Haleem,                     v1
+    95  → English,     Abul Alaa Maududi,                v1
+    19  → English,     Pickthall,                        v1
+    22  → English,     Yusuf Ali,                        v1
+    203 → English,     Hilali & Khan,                    v1
+    779 → French,      Rashid Maash,                     v1
+    136 → French,      Montada Islamic Foundation,       v1
+    31  → French,      Muhammad Hamidullah,              v1
+    208 → German,      Abu Reda Muhammad ibn Ahmad,      v1
+    27  → German,      Frank Bubenheim and Nadeem,       v1
+    122 → Hindi,       Maulana Azizul Haque al-Umari,    v1
+    134 → Indonesian,  King Fahad Quran Complex,         v1
+    33  → Indonesian,  Islamic affairs ministry,         v1
+    141 → Indonesian,  The Sabiq company,                v1
+    224 → Malayalam,   Abdul-Hamid Haidar & Kanhi,       v1
+    80  → Malayalam,   Muhammad Karakunnu,               v1
+    37  → Malayalam,   Abdul Hameed and Kunhi,           v1
+    135 → Persian,     IslamHouse.com,                   v1  (RTL)
+    29  → Persian,     Hussein Taji Kal Dari,            v1  (RTL)
+    79  → Russian,     Abu Adel,                         v1
+    78  → Russian,     Ministry of Awqaf Egypt,          v1
+    45  → Russian,     Elmir Kuliev,                     v1
+    238 → Sindhi,      Taj Mehmood Amroti,               v1  (RTL)
+    229 → Tamil,       Sheikh Omar Sharif,               v1
+    50  → Tamil,       Jan Trust Foundation,             v1
+    133 → Tamil,       Abdul Hameed Baqavi,              v1
+    1   → Translit.,   Simple Tajweed,                   v2
+    3   → Translit.,   Syllables,                        v2
+    57  → Translit.,   Normal,                           v2
+    4   → Translit.,   Advanced Tajweed,                 v1
+    210 → Turkish,     Dar Al-Salam Center,              v1
+    77  → Turkish,     Diyanet,                          v1
+    52  → Turkish,     Elmalili Hamdi Yazir,             v1
+    112 → Turkish,     Shaban Britch,                    v1
+    124 → Turkish,     Muslim Shahin,                    v1
+    156 → Urdu,        Fe Zilal al-Quran,                v1  (RTL)
+    97  → Urdu,        Tafheem Ul Quran (Maududi),       v1  (RTL)
+    234 → Urdu,        Fatah Muhammad Jalandhari,        v1  (RTL)
+    158 → Urdu,        Bayan al-Quran (Dr. Israr),       v1  (RTL)
+    151 → Urdu,        Shaykh al-Hind Mahmud al-Hasan,   v1  (RTL)
+    54  → Urdu,        Maulana Muhammad Junagarhi,       v1  (RTL)
+    819 → Urdu,        Maulana Wahiduddin Khan,          v1  (RTL)
+    831 → Urdu,        Abul Alaa Maududi (Roman Urdu),   v1
+
+=============================================================================
+CHAPTER METADATA (hardcoded – 114 chapters)
+=============================================================================
+
+Each chapter has: id (1–114), Arabic name, English translation,
+transliteration, verse count, revelation type (1=Meccan, 2=Medinan).
+
+Example rows:
+  (1,  "الفاتحة", "The Opening",     "Al Faatiha",   7,   1)
+  (2,  "البقرة",  "The Cow",         "Al Baqara",    286, 2)
+  (3,  "آل عمران","The Family of Imraan","Aal i Imraan",200, 2)
+  ...
+  (114,"الناس",   "Mankind",         "An Naas",      6,   1)
+
+All 114 chapters are available at:
+  https://raw.githubusercontent.com/bilsql/quranwbw/main/src/data/quranMeta.js
+
+=============================================================================
+WHAT YOU MUST BUILD
+=============================================================================
+
+## A – PostgreSQL 18+ Schema (schema.sql)
+
+Create these tables:
+
+  chapters
+    id              SMALLINT PRIMARY KEY          -- 1–114
+    arabic          TEXT NOT NULL
+    translation     TEXT NOT NULL
+    transliteration TEXT NOT NULL
+    verse_count     SMALLINT NOT NULL
+    revelation_type SMALLINT NOT NULL             -- 1=Meccan 2=Medinan
+
+  verses
+    chapter_id  SMALLINT NOT NULL REFERENCES chapters(id)
+    verse_num   SMALLINT NOT NULL
+    page        SMALLINT                          -- mushaf page 1–604
+    juz         SMALLINT                          -- juz 1–30
+    word_count  SMALLINT NOT NULL DEFAULT 0
+    PRIMARY KEY (chapter_id, verse_num)
+
+  words
+    chapter_id    SMALLINT NOT NULL
+    verse_num     SMALLINT NOT NULL
+    word_position SMALLINT NOT NULL               -- 1-based
+    arabic_text   TEXT NOT NULL                   -- Uthmanic glyph
+    transliteration TEXT
+    line_num      SMALLINT
+    PRIMARY KEY (chapter_id, verse_num, word_position)
+    FOREIGN KEY (chapter_id, verse_num) REFERENCES verses
+
+  word_translation_languages   -- lookup, pre-seeded
+    id            SMALLINT PRIMARY KEY
+    language_name TEXT NOT NULL
+    is_rtl        BOOLEAN NOT NULL DEFAULT FALSE
+    font_class    TEXT
+
+  word_translations
+    chapter_id    SMALLINT NOT NULL
+    verse_num     SMALLINT NOT NULL
+    word_position SMALLINT NOT NULL
+    language_id   SMALLINT NOT NULL REFERENCES word_translation_languages(id)
+    translation   TEXT NOT NULL
+    PRIMARY KEY (chapter_id, verse_num, word_position, language_id)
+    FOREIGN KEY (chapter_id, verse_num, word_position) REFERENCES words
+
+  verse_translation_resources  -- lookup, pre-seeded
+    id            SMALLINT PRIMARY KEY
+    language_id   SMALLINT NOT NULL
+    resource_name TEXT NOT NULL
+    is_rtl        BOOLEAN NOT NULL DEFAULT FALSE
+    font_class    TEXT
+
+  verse_translations
+    chapter_id  SMALLINT NOT NULL
+    verse_num   SMALLINT NOT NULL
+    resource_id SMALLINT NOT NULL REFERENCES verse_translation_resources(id)
+    translation TEXT NOT NULL
+    PRIMARY KEY (chapter_id, verse_num, resource_id)
+    FOREIGN KEY (chapter_id, verse_num) REFERENCES verses
+
+Add indexes on: verses(juz), verses(page), words(chapter_id),
+word_translations(language_id), word_translations(chapter_id, verse_num, language_id),
+verse_translations(resource_id), verse_translations(chapter_id, resource_id).
+
+Pre-seed the lookup tables inside the schema file using INSERT … ON CONFLICT DO NOTHING
+so the schema is self-contained.
+
+## B – Async Python seeder (seed.py)
+
+Requirements:
+  - Python 3.11+
+  - Libraries: asyncpg, aiohttp
+  - Accept a DSN via --dsn flag OR DATABASE_URL environment variable
+  - Max 8 concurrent HTTP connections to the CDN
+  - Use asyncpg's copy_records_to_table() for bulk inserts (words,
+    word_translations, verse_translations) for performance
+  - Use INSERT … ON CONFLICT DO NOTHING for chapters and verses (idempotent)
+  - Steps:
+      1. Insert all 114 chapters
+      2. Fetch Arabic words + verse metadata in parallel → insert verses + words
+      3. For each of the 20 word-translation language IDs → fetch + insert
+      4. For each of the 55 verse-translation resource IDs → fetch + insert
+         (normalise both flat and nested JSON formats)
+
+## C – asyncpg API design hints
+
+Your API layer (FastAPI or aiohttp recommended) should expose at minimum:
+
+  GET /chapters
+    Returns list of all 114 chapters with metadata.
+
+  GET /chapters/{chapter_id}/verses
+    Returns all verses of a chapter.
+    Query params:
+      - language_id (int, default 1 = English) → word-translation language
+      - resource_id (int, optional)             → full-verse translation
+
+  GET /chapters/{chapter_id}/verses/{verse_num}/words
+    Returns word-by-word data for one verse.
+    Query param: language_id (int)
+
+  GET /languages
+    Returns all rows from word_translation_languages.
+
+  GET /translation-resources
+    Returns all rows from verse_translation_resources.
+
+Example asyncpg query (words + translations for a full chapter):
+
+  rows = await pool.fetch("""
+      SELECT w.verse_num,
+             w.word_position,
+             w.arabic_text,
+             w.transliteration,
+             wt.translation
+      FROM   words w
+      JOIN   word_translations wt
+               ON  wt.chapter_id    = w.chapter_id
+               AND wt.verse_num     = w.verse_num
+               AND wt.word_position = w.word_position
+               AND wt.language_id   = $2
+      WHERE  w.chapter_id = $1
+      ORDER  BY w.verse_num, w.word_position
+  """, chapter_id, language_id)
+
+  Each row is one Arabic word with its meaning in the requested language.
+  The front-end (web or mobile) iterates over the rows to render the
+  word-by-word view.
+
+=============================================================================
+SETUP STEPS
+=============================================================================
+
+1. Create the database:
+     createdb quran
+
+2. Apply the schema:
+     psql "$DATABASE_URL" -f schema.sql
+
+3. Install Python deps:
+     pip install asyncpg aiohttp
+
+4. Run the seeder (takes a few minutes – ~2M rows total):
+     python seed.py --dsn "postgresql://user:pass@localhost:5432/quran"
+
+5. Start your API server and connect it to the same DSN using:
+     pool = await asyncpg.create_pool(dsn)
+
+=============================================================================
+IMPORTANT NOTES
+=============================================================================
+
+- All data on the CDN is publicly accessible; no API key is required.
+- The CDN URLs are stable and versioned; the version number is part of the
+  query string (e.g. ?version=5).
+- The Arabic glyph strings are font-specific (they are not plain Unicode
+  Arabic text). They must be rendered with the matching web font to display
+  correctly. The font files are served at:
+    https://static.quranwbw.com/data/v4/fonts/Hafs/KFGQPC-v4/
+  If you only need searchable Unicode Arabic, use the full-quran endpoint:
+    GET {BASE}/full-quran/uthmani.json?version=1
+  which returns plain Unicode text keyed by "chapter:verse".
+- RTL languages (Urdu, Persian, Arabic, Sindhi, Divehi) need the CSS
+  direction:rtl property and a matching font on the front-end. The
+  is_rtl and font_class columns in the lookup tables carry that information.
+- The Quran has exactly 114 chapters and 6,236 verses.
+- Word count per verse ranges from 1 to ~50 words.
